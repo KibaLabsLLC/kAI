@@ -1,0 +1,68 @@
+name: Unpack archive at repo root
+
+# Drop kibavoice.tar.gz (or kibavoice_tar.gz) in the repo root and push.
+# The action extracts it at the root (the top-level "kibavoice/" folder is
+# stripped, so install.sh, CMakeLists.txt, src/, ui/ land directly in the root),
+# deletes the archive, and commits the result.
+on:
+  push:
+    paths:
+      - "kibavoice.tar.gz"
+      - "kibavoice_tar.gz"
+  workflow_dispatch:
+    inputs:
+      archive:
+        description: "Archive to unpack (path relative to repo root)"
+        default: "kibavoice.tar.gz"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find archive
+        id: find
+        env:
+          INPUT_ARCHIVE: ${{ github.event.inputs.archive }}
+        run: |
+          for f in "$INPUT_ARCHIVE" kibavoice.tar.gz kibavoice_tar.gz; do
+            if [ -n "$f" ] && [ -f "$f" ]; then
+              echo "archive=$f" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "No archive found; nothing to do."
+          echo "archive=" >> "$GITHUB_OUTPUT"
+
+      - name: Check archive paths are safe
+        if: steps.find.outputs.archive != ''
+        run: |
+          if tar -tzf "${{ steps.find.outputs.archive }}" | grep -E '(^/|(^|/)\.\.(/|$))'; then
+            echo "Archive contains absolute or parent-directory paths; refusing." >&2
+            exit 1
+          fi
+
+      - name: Extract at root
+        if: steps.find.outputs.archive != ''
+        run: |
+          tar -xzf "${{ steps.find.outputs.archive }}" --strip-components=1
+          rm -f "${{ steps.find.outputs.archive }}"
+          chmod +x install.sh 2>/dev/null || true
+
+      - name: Commit
+        if: steps.find.outputs.archive != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Unpack ${{ steps.find.outputs.archive }} at repo root [skip ci]"
+            git push
+          fi

@@ -21,7 +21,7 @@ concurrency:
 env:
   # 0 keeps the archive's top folder (kibavoice/...). Set to 1 to drop it and
   # unpack straight into the folder the archive was pushed to.
-  STRIP_COMPONENTS: 0
+  STRIP_COMPONENTS: 1
 
 jobs:
   unpack:

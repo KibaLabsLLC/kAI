@@ -1,7 +1,0 @@
-<RCC>
-  <qresource prefix="/">
-    <file alias="mascot_idle.png">assets/mascot_idle.png</file>
-    <file alias="mascot_sheet.png">assets/mascot_sheet.png</file>
-    <file alias="kibavoice.png">assets/kibavoice.png</file>
-  </qresource>
-</RCC>

@@ -1,10 +1,11 @@
 // kibavoice - local LLM + speech-to-text + text-to-speech, with a floating UI.
 //
-//   kibavoice ui [--listen]          (opens kibavoice-ui, the floating window)
-//   kibavoice fetch | doctor | install-desktop
+//   kibavoice ui [--background] [--listen]   (opens kibavoice-ui, the voice-only window)
+//   kibavoice fetch | doctor | install-desktop [--autostart]
+//   kibavoice install-service [--no-start] | uninstall-service   (always-on systemd user daemon)
 //   kibavoice ask <text...>  [--no-speak] [--no-notify]
 //   kibavoice listen         [--no-speak] [--no-notify]
-//   kibavoice transcribe <wav>       (prints the text; used by the UI)
+//   kibavoice transcribe <wav> [--wake]   (prints the text; used by the UI)
 //   kibavoice say <text...>
 //   kibavoice history | show <id> | replay <id>
 //
@@ -173,9 +174,13 @@ static bool download(const std::string& url, const fs::path& dest, uintmax_t min
     fs::create_directories(dest.parent_path(), ec);
     fs::path part = dest; part += ".part";
     std::cerr << "kibavoice: downloading " << dest.filename().string() << "\n";
-    int rc = run({"curl", "-fL", "--retry", "3", "-C", "-", "-o", part.string(), url});
-    if (rc != 0) { std::cerr << "kibavoice: download failed (" << url << ")\n"; return false; }
-    if (fs::file_size(part, ec) < min_bytes) {
+    int rc = run({"curl", "-fL", "--retry", "3", "--connect-timeout", "20", "-C", "-", "-o", part.string(), url});
+    // 33 = server refused the resume range because the .part file is already complete
+    if (rc != 0 && !(rc == 33 && fs::exists(part, ec))) {
+        std::cerr << "kibavoice: download failed (" << url << ")\n";
+        return false;
+    }
+    if (!fs::exists(part, ec) || fs::file_size(part, ec) < min_bytes) {
         std::cerr << "kibavoice: " << dest.filename().string() << " is smaller than expected, discarding\n";
         fs::remove(part, ec);
         return false;
@@ -239,7 +244,8 @@ static bool ensure_tts(const Assets& a) {
     std::stringstream ss(a.voice_id);
     for (std::string s; std::getline(ss, s, '-');) p.push_back(s);
     if (p.size() != 3 || p[0].size() < 2) { std::cerr << "kibavoice: bad KIBAVOICE_VOICE id\n"; return false; }
-    std::string base = "https://huggingface.co/rhasspy/piper-voices/resolve/main/" + p[0].substr(0, 2) + "/" +
+    // Pinned to the v1.0.0 tag (what Piper's own docs use) so a reshuffle of `main` can't break downloads.
+    std::string base = "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/" + p[0].substr(0, 2) + "/" +
                        p[0] + "/" + p[1] + "/" + p[2] + "/" + a.voice_id;
     return download(base + ".onnx", a.voice, 1ull << 20) && download(base + ".onnx.json", a.voice_json, 50);
 }
@@ -370,13 +376,15 @@ static std::string whisper_bin() {
     return which("whisper-cli");
 }
 
-static std::string transcribe(const Assets& a, const fs::path& wav) {
+// wake=true: bias Whisper toward "Hey Kiba" and decode greedily (fast, for always-on listening).
+static std::string transcribe(const Assets& a, const fs::path& wav, bool wake = false) {
     std::string bin = whisper_bin();
     if (bin.empty()) { std::cerr << "kibavoice: whisper-cli not found (build with KIBAVOICE_BUILD_WHISPER=ON)\n"; return ""; }
     std::string out;
     int thr = (int)std::max(1u, std::min(4u, std::thread::hardware_concurrency()));
-    run({bin, "-m", a.stt.string(), "-f", wav.string(), "-nt", "-np", "-t", std::to_string(thr)},
-        {"", &out, true, {}});
+    std::vector<std::string> cmd{bin, "-m", a.stt.string(), "-f", wav.string(), "-nt", "-np", "-t", std::to_string(thr)};
+    if (wake) for (const char* x : {"--prompt", "Hey Kiba.", "-bs", "1", "-bo", "1"}) cmd.push_back(x);
+    run(cmd, {"", &out, true, {}});
     out = oneline(out, 1000);
     if (out.find("[BLANK_AUDIO]") != std::string::npos) return "";
     return out;
@@ -476,6 +484,7 @@ static int do_fetch() {
 }
 
 static fs::path ui_bin();
+static bool systemctl_user(const std::vector<std::string>& args, std::string* out);
 static int do_doctor() {
     Assets a = assets();
     auto line = [](const std::string& n, bool ok, const std::string& extra = "") {
@@ -490,6 +499,18 @@ static int do_doctor() {
     for (auto t : {"curl", "tar", "arecord"}) line(t, !which(t).empty());
     line("audio player", !which("paplay").empty() || !which("pw-play").empty() || !which("aplay").empty());
     line("notify-send (optional)", !which("notify-send").empty());
+    if (!which("systemctl").empty()) {
+        std::string st;
+        systemctl_user({"is-active", "kibavoice.service"}, &st);
+        st = trim(st);
+        std::string en;
+        systemctl_user({"is-enabled", "kibavoice.service"}, &en);
+        en = trim(en);
+        const bool installed = !en.empty() && en != "not-found";
+        line("daemon (systemd user service)", st == "active",
+             installed ? ("state=" + (st.empty() ? "unknown" : st) + ", " + en)
+                       : "not installed (kibavoice install-service)");
+    }
     return 0;
 }
 
@@ -522,7 +543,7 @@ static std::string desktop_quote(const std::string& s) {
 }
 
 // Menu entry + app icon, so the window can be launched from the desktop menu or a hotkey.
-static int do_install_desktop() {
+static int do_install_desktop(bool autostart) {
     fs::path ui = ui_bin();
     if (ui.empty()) { std::cerr << "kibavoice: kibavoice-ui not found\n"; return 1; }
     std::error_code ec;
@@ -537,21 +558,134 @@ static int do_install_desktop() {
     std::ofstream f(file);
     if (!f) { std::cerr << "kibavoice: cannot write " << file << "\n"; return 1; }
     const std::string exec = desktop_quote(ui.string());
-    f << "[Desktop Entry]\nType=Application\nName=Kiba\nComment=Local voice assistant\n"
-      << "Exec=" << exec << "\nIcon=kibavoice\nTerminal=false\nCategories=Utility;\n"
-      << "StartupWMClass=kibavoice\nActions=Listen;\n\n"
+    f << "[Desktop Entry]\nType=Application\nName=Kiba\nGenericName=Voice Assistant\n"
+      << "Comment=Local, offline voice assistant\nKeywords=voice;assistant;kiba;speech;\n"
+      << "Exec=" << exec << "\nIcon=kibavoice\nTerminal=false\nStartupNotify=false\n"
+      << "Categories=Utility;AudioVideo;\nStartupWMClass=kibavoice\nActions=Listen;\n\n"
       << "[Desktop Action Listen]\nName=Talk to Kiba\nExec=" << exec << " --listen\n";
-    std::cout << "wrote " << file.string() << "\n"
-              << "Tip: bind a hotkey to `" << ui.string() << " --listen` to talk from anywhere.\n";
+    f.close();
+    std::cout << "wrote " << file.string() << "\n";
+    // best effort: make the menu entry and icon show up without a re-login
+    RunOpts q{"", nullptr, true, {}};
+    if (!which("update-desktop-database").empty()) run({"update-desktop-database", dir.string()}, q);
+    if (!which("gtk-update-icon-cache").empty())
+        run({"gtk-update-icon-cache", "-q", "-t", "-f", (share / "icons/hicolor").string()}, q);
+    if (autostart) {   // start hidden at login; the window appears when you say "Hey Kiba"
+        fs::path adir = fs::path(env_or("XDG_CONFIG_HOME", (home() / ".config").string())) / "autostart";
+        fs::create_directories(adir, ec);
+        std::ofstream a(adir / "kibavoice.desktop");
+        if (!a) { std::cerr << "kibavoice: cannot write autostart entry\n"; return 1; }
+        a << "[Desktop Entry]\nType=Application\nName=Kiba\nComment=Listens for \"Hey Kiba\"\n"
+          << "Exec=" << exec << " --background\nIcon=kibavoice\nTerminal=false\nX-GNOME-Autostart-enabled=true\n";
+        std::cout << "wrote " << (adir / "kibavoice.desktop").string() << " (starts hidden at login)\n";
+    }
     return 0;
 }
 
-static int do_transcribe(const std::string& wav) {
+// systemd unit values: double-quoted, with backslash, quote, % and $ escaped.
+static std::string systemd_quote(const std::string& s) {
+    std::string o = "\"";
+    for (char c : s) {
+        if (c == '"' || c == '\\') o += '\\';
+        if (c == '%' || c == '$') o += c;   // doubled: %% and $$
+        o += c;
+    }
+    return o + "\"";
+}
+
+static fs::path config_home() {
+    return fs::path(env_or("XDG_CONFIG_HOME", (home() / ".config").string()));
+}
+
+static bool systemctl_user(const std::vector<std::string>& args, std::string* out) {
+    std::vector<std::string> a{"systemctl", "--user"};
+    a.insert(a.end(), args.begin(), args.end());
+    RunOpts o; o.quiet = true; o.out = out;
+    return run(a, o) == 0;
+}
+
+// Always-on mode: a systemd *user* service running `kibavoice-ui --background`.
+// It must be a user service (not a system one) because the microphone, audio output and the
+// popup window all belong to the logged-in desktop session.
+static int do_install_service(bool start) {
+    fs::path ui = ui_bin();
+    if (ui.empty()) { std::cerr << "kibavoice: kibavoice-ui not found (build with Qt6)\n"; return 1; }
+    if (which("systemctl").empty()) {
+        std::cerr << "kibavoice: systemctl not found; use `kibavoice install-desktop --autostart` instead\n";
+        return 1;
+    }
+    std::error_code ec;
+    fs::path dir = config_home() / "systemd" / "user";
+    fs::create_directories(dir, ec);
+    fs::path unit = dir / "kibavoice.service";
+    std::ofstream f(unit);
+    if (!f) { std::cerr << "kibavoice: cannot write " << unit << "\n"; return 1; }
+    f << "[Unit]\n"
+         "Description=Kiba voice assistant (listens for \"Hey Kiba\")\n"
+         "After=graphical-session.target pipewire.service pipewire-pulse.service sound.target\n"
+         "PartOf=graphical-session.target\n"
+         "StartLimitIntervalSec=120\n"
+         "StartLimitBurst=8\n\n"
+         "[Service]\n"
+         "Type=simple\n"
+         "ExecStart=" << systemd_quote(ui.string()) << " --background\n"
+         "# Restart after crashes and kills. A clean exit (tray Quit, `kibavoice-ui --quit`) stays stopped.\n"
+         "Restart=on-failure\n"
+         "RestartSec=3\n"
+         "Nice=5\n"
+         "Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin\n"
+         "\n"
+         "[Install]\n"
+         "WantedBy=graphical-session.target\n";
+    f.close();
+    std::cout << "wrote " << unit.string() << "\n";
+
+    // Hand the running session's display variables to the user manager (no-op if unset).
+    systemctl_user({"import-environment", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE"}, nullptr);
+    if (!systemctl_user({"daemon-reload"}, nullptr)) {
+        std::cerr << "kibavoice: `systemctl --user` is not available in this session\n"
+                     "           (unit written; enable it later with: systemctl --user enable --now kibavoice)\n";
+        return 1;
+    }
+    bool ok = systemctl_user(start ? std::vector<std::string>{"enable", "--now", "kibavoice.service"}
+                                   : std::vector<std::string>{"enable", "kibavoice.service"}, nullptr);
+    if (!ok) { std::cerr << "kibavoice: could not enable the service\n"; return 1; }
+
+    // The service replaces the plain autostart entry; two launchers would just race.
+    // Only drop it when the session really starts graphical-session.target (plain i3/sway
+    // setups often don't, and would then lose autostart entirely).
+    fs::path legacy = config_home() / "autostart" / "kibavoice.desktop";
+    if (fs::exists(legacy, ec)) {
+        if (systemctl_user({"is-active", "--quiet", "graphical-session.target"}, nullptr)) {
+            fs::remove(legacy, ec);
+            std::cout << "removed old autostart entry (the service replaces it)\n";
+        } else {
+            std::cout << "kept " << legacy.string() << " (this session does not activate graphical-session.target)\n";
+        }
+    }
+    std::cout << (start ? "kibavoice daemon enabled and started.\n" : "kibavoice daemon enabled (starts at next login).\n")
+              << "  status : systemctl --user status kibavoice\n"
+                 "  logs   : journalctl --user -u kibavoice -f\n"
+                 "  stop   : kibavoice-ui --quit   (or: systemctl --user stop kibavoice)\n";
+    return 0;
+}
+
+static int do_uninstall_service() {
+    std::error_code ec;
+    if (!which("systemctl").empty()) systemctl_user({"disable", "--now", "kibavoice.service"}, nullptr);
+    fs::path unit = config_home() / "systemd" / "user" / "kibavoice.service";
+    if (fs::remove(unit, ec)) std::cout << "removed " << unit.string() << "\n";
+    if (!which("systemctl").empty()) systemctl_user({"daemon-reload"}, nullptr);
+    std::cout << "kibavoice daemon removed.\n";
+    return 0;
+}
+
+static int do_transcribe(const std::string& wav, bool wake) {
     Assets a = assets();
     std::error_code ec;
     if (wav.empty() || !fs::exists(wav, ec)) { std::cerr << "usage: kibavoice transcribe <file.wav>\n"; return 2; }
     if (!ensure_stt(a)) return 1;
-    std::string q = transcribe(a, wav);
+    std::string q = transcribe(a, wav, wake);
     if (q.empty()) return 1;
     std::cout << q << "\n";
     return 0;
@@ -575,8 +709,14 @@ int main(int argc, char** argv) {
     if (cmd == "fetch") return do_fetch();
     if (cmd == "doctor") return do_doctor();
     if (cmd == "ui") return do_ui(argc, argv);
-    if (cmd == "install-desktop") return do_install_desktop();
-    if (cmd == "transcribe" && argc >= 3) return do_transcribe(argv[2]);
+    if (cmd == "install-service") return do_install_service(!(argc > 2 && std::string(argv[2]) == "--no-start"));
+    if (cmd == "uninstall-service") return do_uninstall_service();
+    if (cmd == "install-desktop") return do_install_desktop(argc > 2 && std::string(argv[2]) == "--autostart");
+    if (cmd == "transcribe" && argc >= 3) {
+        bool wake = false;
+        for (int i = 3; i < argc; ++i) if (std::string(argv[i]) == "--wake") wake = true;
+        return do_transcribe(argv[2], wake);
+    }
     if (cmd == "history") return do_history();
     if ((cmd == "show" || cmd == "replay") && argc >= 3) {
         std::string id = argv[2];
@@ -592,8 +732,9 @@ int main(int argc, char** argv) {
         return 0;
     }
     std::cout << "kibavoice: local LLM + STT + TTS with a floating UI\n"
-                 "  ui [--listen] | fetch | doctor | install-desktop\n"
+                 "  ui [--background] [--listen] | fetch | doctor | install-desktop [--autostart]\n"
+                 "  install-service [--no-start] | uninstall-service   (always-on daemon)\n"
                  "  ask <text> | listen [--no-speak] [--no-notify]\n"
-                 "  transcribe <wav> | say <text> | history | show <id> | replay <id>\n";
+                 "  transcribe <wav> [--wake] | say <text> | history | show <id> | replay <id>\n";
     return cmd == "help" ? 0 : 2;
 }

@@ -1,12 +1,16 @@
 // kibavoice-ui: minimalist floating window for kibavoice.
-//   kibavoice-ui            open the window (or raise the one that is already open)
-//   kibavoice-ui --listen   open and start listening right away (bind this to a hotkey)
+//   kibavoice-ui              open the window and wait for "Hey Kiba"
+//   kibavoice-ui --background start hidden; the window pops up when you say "Hey Kiba"
+//   kibavoice-ui --listen     open and start listening right away (skip the wake phrase)
+//   kibavoice-ui --quit       stop a running instance (the always-on daemon included)
 #include <QApplication>
 #include <QIcon>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QMenu>
 #include <QPalette>
 #include <QStyleFactory>
+#include <QSystemTrayIcon>
 
 #include "theme.h"
 #include "window.h"
@@ -15,12 +19,14 @@ int main(int argc, char** argv) {
     QApplication app(argc, argv);
     QApplication::setApplicationName("kibavoice");
     QApplication::setDesktopFileName("kibavoice");
-    bool listen = false;
+    bool listen = false, background = false, quit = false;
     for (int i = 1; i < argc; ++i) {
         const QString a = argv[i];
         if (a == "--listen") listen = true;
+        else if (a == "--background") background = true;
+        else if (a == "--quit") quit = true;
         else if (a == "-h" || a == "--help") {
-            puts("kibavoice-ui [--listen]\n  Floating Kiba assistant. Esc closes.");
+            puts("kibavoice-ui [--background] [--listen] [--quit]\n  Say \"Hey Kiba\". Esc closes (hides, in --background mode).");
             return 0;
         }
     }
@@ -31,11 +37,12 @@ int main(int argc, char** argv) {
         QLocalSocket probe;
         probe.connectToServer(name);
         if (probe.waitForConnected(200)) {
-            probe.write(listen ? "listen\n" : "show\n");
+            probe.write(quit ? "quit\n" : listen ? "listen\n" : "show\n");
             probe.waitForBytesWritten(500);
             return 0;
         }
     }
+    if (quit) return 0;   // nothing running, nothing to stop
 
     // Always light, whatever the desktop theme says.
     QApplication::setStyle(QStyleFactory::create("Fusion"));
@@ -54,7 +61,8 @@ int main(int argc, char** argv) {
     QApplication::setFont(theme::font(10.5));
     QApplication::setWindowIcon(QIcon(":/kibavoice.png"));
 
-    FloatingWindow w;
+    QApplication::setQuitOnLastWindowClosed(false);   // hidden background window must not quit the app
+    FloatingWindow w(background);
 
     QLocalServer::removeServer(name);
     QLocalServer server;
@@ -63,13 +71,33 @@ int main(int argc, char** argv) {
     QObject::connect(&server, &QLocalServer::newConnection, &w, [&] {
         while (QLocalSocket* s = server.nextPendingConnection()) {
             QObject::connect(s, &QLocalSocket::readyRead, &w, [&w, s] {
-                w.present(s->readAll().contains("listen"));
+                const QByteArray msg = s->readAll();
+                if (msg.contains("quit")) QApplication::quit();
+                else if (msg.contains("listen")) w.present(true);       // hotkey: tucks away after the answer
+                else w.present(false, true);                            // menu launch: stays until closed
                 s->deleteLater();
             });
             QObject::connect(s, &QLocalSocket::disconnected, s, &QObject::deleteLater);
         }
     });
 
-    w.present(listen);
+    // Daemon mode gets a tray icon (where the desktop has one) so it can be shown, used or quit.
+    QSystemTrayIcon* tray = nullptr;
+    if (background && QSystemTrayIcon::isSystemTrayAvailable()) {
+        tray = new QSystemTrayIcon(QIcon(":/kibavoice.png"), &app);
+        auto* menu = new QMenu;
+        menu->addAction("Show Kiba", &w, [&w] { w.present(false, true); });
+        menu->addAction("Talk to Kiba", &w, [&w] { w.present(true); });
+        menu->addSeparator();
+        menu->addAction("Quit Kiba", &app, &QApplication::quit);
+        tray->setContextMenu(menu);
+        tray->setToolTip("Kiba: say “Hey Kiba”");
+        QObject::connect(tray, &QSystemTrayIcon::activated, &w, [&w](QSystemTrayIcon::ActivationReason r) {
+            if (r == QSystemTrayIcon::Trigger) w.present(false, true);
+        });
+        tray->show();
+    }
+
+    if (!background || listen) w.present(listen, !background);
     return app.exec();
 }

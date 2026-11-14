@@ -24,33 +24,6 @@ QString Backend::dataDir() {
     return base + "/kibavoice";
 }
 
-static QString slurp(const QString& path) {
-    QFile f(path);
-    return f.open(QIODevice::ReadOnly) ? QString::fromUtf8(f.readAll()).trimmed() : QString();
-}
-
-QList<ChatEntry> Backend::loadHistory(int max) const {
-    QList<ChatEntry> out;
-    QFile f(dataDir() + "/history.tsv");
-    if (!f.open(QIODevice::ReadOnly)) return out;
-    QStringList ids;
-    while (!f.atEnd()) {
-        const QString id = QString::fromUtf8(f.readLine()).section('\t', 0, 0).trimmed();
-        if (!id.isEmpty() && id.size() < 24 && id.toLongLong() > 0) ids << id;
-    }
-    for (int i = qMax(0, ids.size() - max); i < ids.size(); ++i) {
-        const QString base = dataDir() + "/history/" + ids[i];
-        const QString q = slurp(base + ".q"), a = slurp(base + ".a");
-        if (!q.isEmpty() && !a.isEmpty()) out.push_back({ids[i], q, a});
-    }
-    return out;
-}
-
-QString Backend::lastHistoryId() const {
-    const auto h = loadHistory(1);
-    return h.isEmpty() ? QString() : h.last().id;
-}
-
 static bool anyFile(const QString& glob) {
     return !QDir(Backend::dataDir() + "/models").entryList({glob}, QDir::Files).isEmpty();
 }
@@ -64,9 +37,23 @@ QProcess* Backend::spawn(const QStringList& args, bool ownGroup) {
     return p;
 }
 
-void Backend::transcribe(const QString& wavPath) {
+void Backend::fetchModels() {
     if (job_) return;
-    job_ = spawn({"transcribe", wavPath});
+    job_ = spawn({"fetch"});
+    connect(job_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart) { job_->deleteLater(); job_ = nullptr; emit fetched(false); }
+    });
+    connect(job_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) {
+        job_->deleteLater(); job_ = nullptr;
+        emit fetched(code == 0);
+    });
+}
+
+void Backend::transcribe(const QString& wavPath, bool wake) {
+    if (job_) { QFile::remove(wavPath); return; }
+    QStringList args{"transcribe", wavPath};
+    if (wake) args << "--wake";
+    job_ = spawn(args);
     connect(job_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
         if (e == QProcess::FailedToStart) { job_->deleteLater(); job_ = nullptr; emit failed("kibavoice binary not found"); }
     });
@@ -96,18 +83,6 @@ void Backend::ask(const QString& question) {
 void Backend::speak(const QString& text) {
     stopSpeaking();
     speech_ = spawn({"say", text}, true);
-    connect(speech_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this](int, QProcess::ExitStatus) {
-        speech_->deleteLater(); speech_ = nullptr;
-        emit speechFinished();
-    });
-}
-
-void Backend::replay(const QString& id) {
-    bool ok = false;
-    id.toLongLong(&ok);
-    if (!ok) return;
-    stopSpeaking();
-    speech_ = spawn({"replay", id}, true);
     connect(speech_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this](int, QProcess::ExitStatus) {
         speech_->deleteLater(); speech_ = nullptr;
         emit speechFinished();

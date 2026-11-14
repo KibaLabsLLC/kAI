@@ -1,11 +1,9 @@
 #pragma once
-#include <QAbstractScrollArea>
 #include <QElapsedTimer>
 #include <QMouseEvent>
 #include <QPixmap>
 #include <QTimer>
 #include <QWidget>
-#include <vector>
 
 // ---- Mascot: idle pose floats gently; the sprite animation plays while busy ----
 class MascotWidget : public QWidget {
@@ -71,32 +69,4 @@ protected:
 private:
     Kind kind_;
     bool hover_ = false, down_ = false, busy_ = false;
-};
-
-// ---- Conversation list: previous chats + the live exchange ----
-class ChatView : public QAbstractScrollArea {
-    Q_OBJECT
-public:
-    explicit ChatView(QWidget* parent = nullptr);
-    void clear();
-    void addUser(const QString& text);
-    void addAssistant(const QString& text, const QString& id = {});
-    void setLastAssistantId(const QString& id);
-    void markPreviousChats(bool on) { hasPrevious_ = on; relayout(); }
-signals:
-    void replayRequested(const QString& id);
-protected:
-    void paintEvent(QPaintEvent*) override;
-    void resizeEvent(QResizeEvent*) override { relayout(); }
-    void mousePressEvent(QMouseEvent* e) override { e->accept(); }
-    void mouseMoveEvent(QMouseEvent*) override;
-    void mouseReleaseEvent(QMouseEvent*) override;
-private:
-    struct Item { bool user; QString text, id; QRect box; };
-    void relayout();
-    int hit(const QPoint& vp) const;
-    void scrollToEnd();
-    std::vector<Item> items_;
-    int total_ = 0;
-    bool hasPrevious_ = false;
 };

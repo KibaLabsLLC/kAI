@@ -1,14 +1,4 @@
-// kibavoice - local companion: LLM + speech-to-text + text-to-speech, plus memory, web search,
-// OS actions and MCP tools. Child processes use execvp with argv vectors, never a shell, so text
-// from the model, the microphone or the web cannot inject commands.
-//   kibavoice ui [--background] [--listen] | fetch | doctor | install-desktop [--autostart]
-//   kibavoice install-service [--no-start] | uninstall-service
-//   kibavoice ask <text...> | listen [--no-speak] [--no-notify] | transcribe <wav> [--wake] | say <text...>
-//   kibavoice history | show <id> | replay <id>
-//   kibavoice memory list | add <text> | rm <text> | clear
-//   kibavoice connect <service> | disconnect <service> | accounts     (also: just say "connect to my Notion account")
-//   kibavoice mcp add <name> <url|command...> [--token T] | list | rm <name> | refresh | ui     (advanced, manual)
-// LLM: llama.cpp (linked)  STT: whisper-cli  TTS: Piper  Audio: arecord + paplay/pw-play/aplay  HTTP: curl
+// kAI
 
 #include "ggml-backend.h"
 #include "llama.h"

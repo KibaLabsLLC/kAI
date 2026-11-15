@@ -774,7 +774,7 @@ struct Mcp {
         S hdr = "Content-Type: application/json\nAccept: application/json, text/event-stream\n";   // headers go via a 0600 file: tokens stay out of `ps`
         if (!s.token.empty()) hdr += "Authorization: Bearer " + s.token + "\n";
         if (!sid.empty()) hdr += "Mcp-Session-Id: " + sid + "\n";
-        int fd = open(hf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        int fd = ::open(hf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd < 0) { err = "cannot write temp file"; return J(); }
         ssize_t wr = write(fd, hdr.data(), hdr.size()); (void)wr; close(fd);
         S body;

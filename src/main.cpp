@@ -1,13 +1,4 @@
-// kibavoice - local companion: LLM + speech-to-text + text-to-speech, plus memory, web search,
-// OS actions and MCP tools. Child processes use execvp with argv vectors, never a shell, so text
-// from the model, the microphone or the web cannot inject commands.
-//   kibavoice ui [--background] [--listen] | fetch | doctor | install-desktop [--autostart]
-//   kibavoice install-service [--no-start] | uninstall-service
-//   kibavoice ask <text...> | listen [--no-speak] [--no-notify] | transcribe <wav> [--wake] | say <text...>
-//   kibavoice history | show <id> | replay <id>
-//   kibavoice memory list | add <text> | rm <text> | clear
-//   kibavoice mcp add <name> <url|command...> [--token T] | list | rm <name> | refresh | ui
-// LLM: llama.cpp (linked)  STT: whisper-cli  TTS: Piper  Audio: arecord + paplay/pw-play/aplay  HTTP: curl
+// kAI
 
 #include "ggml-backend.h"
 #include "llama.h"
@@ -58,7 +49,7 @@ static bool debug() { return std::getenv("KIBAVOICE_DEBUG") != nullptr; }
 // 1.5B instead of 0.5B: tiny models are unreliable at calling tools. Override with KIBAVOICE_LLM_URL.
 static const char* kDefaultLlmUrl = "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf";
 static const char* kDefaultSttUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin";
-static const char* kDefaultVoice = "en_US-lessac-medium";
+static const char* kDefaultVoice = "en_US-john-medium";
 static const char* kPiperBase = "https://github.com/rhasspy/piper/releases/download/v1.2.0/";
 
 static const char* kPersona =
@@ -454,21 +445,56 @@ static S transcribe(const Assets& a, const fs::path& wav, bool wake = false) {
     out = oneline(out, 1000);
     return out.find("[BLANK_AUDIO]") != S::npos ? "" : out;
 }
+static int sample_rate(const fs::path& json) {
+    S j = slurp(json); size_t p = j.find("\"sample_rate\"");
+    p = (p == S::npos) ? p : j.find(':', p);
+    int r = (p == S::npos) ? 0 : std::atoi(j.c_str() + p + 1);
+    return r > 0 ? r : 22050;
+}
+// Streams Piper's raw PCM straight into the player: no temp WAV, and Piper never gets to print a path.
 static void speak(const Assets& a, const S& text) {
     S t = clean_for_speech(text);
+    for (auto& c : t) if (c == '\n' || c == '\r') c = ' ';   // one line = one utterance
     if (t.empty()) return;
-    fs::path wav = data_dir() / "tmp-speech.wav";
+    S rate = std::to_string(sample_rate(a.voice_json));
+    VS player;
+    if (!which("paplay").empty()) player = {"paplay", "--raw", "--rate=" + rate, "--format=s16le", "--channels=1"};
+    else if (!which("pw-play").empty()) player = {"pw-play", "--rate", rate, "--format", "s16", "--channels", "1", "-"};
+    else if (!which("aplay").empty()) player = {"aplay", "-q", "-t", "raw", "-f", "S16_LE", "-r", rate, "-c", "1"};
+    else { std::cerr << "kibavoice: no audio player (paplay/pw-play/aplay)\n"; return; }
+
+    VS pcmd{a.piper_bin.string(), "--model", a.voice.string(), "--espeak_data",
+            (a.piper_dir / "espeak-ng-data").string(), "--output-raw"};
     S ld = env_or("LD_LIBRARY_PATH", "");
-    int rc = run({a.piper_bin.string(), "--model", a.voice.string(), "--espeak_data", (a.piper_dir / "espeak-ng-data").string(), "--output_file", wav.string()},
-                 {t, nullptr, true, {"LD_LIBRARY_PATH=" + a.piper_dir.string() + (ld.empty() ? "" : ":" + ld)}});
-    if (rc != 0) { std::cerr << "kibavoice: piper failed\n"; return; }
-    for (auto& pl : std::vector<VS>{{"paplay"}, {"pw-play"}, {"aplay", "-q"}}) {
-        if (which(pl[0]).empty()) continue;
-        VS argv = pl; argv.push_back(wav.string());
-        run(argv, {"", nullptr, true, {}});
-        return;
+    S ldv = a.piper_dir.string() + (ld.empty() ? "" : ":" + ld);
+
+    int in[2], mid[2];
+    if (pipe(in) != 0) return;
+    if (pipe(mid) != 0) { close(in[0]); close(in[1]); return; }
+    auto closeall = [&] { close(in[0]); close(in[1]); close(mid[0]); close(mid[1]); };
+
+    pid_t pp = fork();
+    if (pp == 0) {                                   // piper: text in, PCM out
+        dup2(in[0], 0); dup2(mid[1], 1); closeall();
+        if (!debug()) devnull(2, O_WRONLY);
+        setenv("LD_LIBRARY_PATH", ldv.c_str(), 1);
+        auto av = cv(pcmd); execvp(av[0], av.data()); _exit(127);
     }
-    std::cerr << "kibavoice: no audio player (paplay/pw-play/aplay)\n";
+    pid_t pl = fork();
+    if (pl == 0) {                                   // player: PCM in
+        dup2(mid[0], 0); closeall();
+        devnull(1, O_WRONLY); if (!debug()) devnull(2, O_WRONLY);
+        auto av = cv(player); execvp(av[0], av.data()); _exit(127);
+    }
+    close(in[0]); close(mid[0]); close(mid[1]);
+    S line = t + "\n";
+    for (size_t off = 0; off < line.size();) {
+        ssize_t w = write(in[1], line.data() + off, line.size() - off);
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    close(in[1]);
+    int st; if (pp > 0) waitpid(pp, &st, 0); if (pl > 0) waitpid(pl, &st, 0);
 }
 
 // -------------------------------------------------------------- history ----
@@ -774,7 +800,7 @@ struct Mcp {
         S hdr = "Content-Type: application/json\nAccept: application/json, text/event-stream\n";   // headers go via a 0600 file: tokens stay out of `ps`
         if (!s.token.empty()) hdr += "Authorization: Bearer " + s.token + "\n";
         if (!sid.empty()) hdr += "Mcp-Session-Id: " + sid + "\n";
-        int fd = ::open(hf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        int fd = open(hf.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd < 0) { err = "cannot write temp file"; return J(); }
         ssize_t wr = write(fd, hdr.data(), hdr.size()); (void)wr; close(fd);
         S body;

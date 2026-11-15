@@ -15,7 +15,7 @@ No text box, no chat history.
 
 | Part | What | Fetched automatically |
 |------|------|-----------------------|
-| LLM  | llama.cpp (linked), Qwen2.5-0.5B-Instruct Q4_K_M, ~400 MB | first run |
+| LLM  | llama.cpp (linked), Qwen2.5-1.5B-Instruct Q4_K_M, ~940 MB | first run |
 | STT  | whisper.cpp `whisper-cli` + `ggml-tiny.en.bin`, ~75 MB | first run |
 | TTS  | Piper v1.2.0 binary + `en_US-john-medium` voice | first run |
 | UI   | Qt6 Widgets (`kibavoice-ui`) | built with the project |
@@ -27,7 +27,7 @@ Models land in `~/.local/share/kibavoice/`. Override with `KIBAVOICE_LLM_URL`,
 
     ./install.sh --deps      # --deps installs packages via apt/pacman/dnf (needs sudo); omit if you have them
 
-That builds everything, installs to `~/.local`, downloads the models (~550 MB), adds **Kiba** to your
+That builds everything, installs to `~/.local`, downloads the models (~1.1 GB), adds **Kiba** to your
 app menu, and installs the always-on daemon. Other flags: `--no-service` (launcher only),
 `--no-models` (download on first run instead), `--prefix DIR`, `--uninstall`.
 

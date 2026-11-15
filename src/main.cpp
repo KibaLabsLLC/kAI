@@ -55,7 +55,7 @@ static const char* kPiperBase =
 
 static const char* kSystemPrompt =
     "You are a concise voice assistant inside a desktop launcher. Answer in at most "
-    "three short sentences of plain spoken English. No markdown, no lists, no emoji.";
+    "three short sentences of plain spoken English. No markdown, no lists, no emoji."
     "Your name is Kiba and you were made by Kiba Labs, LLC for the KibaOS Operating system, your character is an orb with raccoon ears and tail";
 
 static fs::path home() { return env_or("HOME", "/tmp"); }

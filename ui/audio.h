@@ -8,6 +8,9 @@
 #include <QByteArray>
 #include <QObject>
 #include <QProcess>
+#include <QString>
+#include <QTimer>
+#include <cstdint>
 #include <deque>
 #include <vector>
 
@@ -29,6 +32,12 @@ signals:
     void utteranceReady(const QString& wavPath, bool command);
     void nothingHeard();
     void error(const QString& message);
+    // Emitted by notifyYield() only when the yield state the UI knows about changes.
+    // (Guessed name/signature: match whatever audio.cpp actually emits.)
+    void yieldChanged(bool yielded, const QString& who);
+
+private slots:
+    void watchTick();   // QTimer::timeout target
 
 private:
     bool ensureProcess();
@@ -38,13 +47,26 @@ private:
     void finishUtterance();
     void resetAnalysis();
 
+    // Mic yielding: step aside when another app wants the mic, reclaim it when free
+    void notifyYield(bool y, const QString& who);
+    void yieldMic(const QString& who);
+    void reclaimMic();
+    void applyProbe(const QString& who);
+    void recorderGone(const QString& why);
+
     QProcess* proc_ = nullptr;
+    QProcess* probe_ = nullptr;   // checks whether someone else is using the mic
+    QTimer* watch_ = nullptr;     // polls for mic contention
     QString dir_;
+    QString lastErr_;             // recorder's last stderr line
     QByteArray buf_;
     Mode mode_ = Off;
     std::vector<int16_t> pcm_;
     std::deque<std::vector<int16_t>> pre_;   // pre-roll so the first syllable isn't clipped
     bool started_ = false, calibrated_ = false;
+    bool yielded_ = false;        // true while we've released the mic (no recorder running)
     int calib_ = 0, loud_ = 0, quiet_ = 0, idle_ = 0, len_ = 0, seq_ = 0;
+    int busyTicks_ = 0, freeTicks_ = 0, fails_ = 0, recIdx_ = 0;
+    qint64 startMs_ = 0;
     double noise_ = 0, thr_ = 600;
 };

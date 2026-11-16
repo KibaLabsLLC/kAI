@@ -16,6 +16,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/file.h>
@@ -345,6 +346,8 @@ static bool ensure_tts(const Assets& a) {
 }
 
 // ------------------------------------------------------------------ LLM ----
+// KV cache type: q8_0 (default) takes about half the memory of f16. KIBAVOICE_KV=f16 turns it off.
+static ggml_type kv_type() { return lower(env_or("KIBAVOICE_KV", "q8_0")) == "f16" ? GGML_TYPE_F16 : GGML_TYPE_Q8_0; }
 static void quiet_log(ggml_log_level lvl, const char* text, void*) { if (debug() || lvl >= GGML_LOG_LEVEL_ERROR) fputs(text, stderr); }
 static int nthreads() {   // all cores (up to 8); KIBAVOICE_THREADS overrides
     int t = std::atoi(env_or("KIBAVOICE_THREADS", "0").c_str());
@@ -371,7 +374,9 @@ struct Llm {
         c_n = std::max(ctx_n, (need + 255) / 256 * 256);
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx = (uint32_t)c_n; cp.n_batch = 512; cp.n_threads = cp.n_threads_batch = nthreads();
+        cp.type_k = cp.type_v = kv_type();
         c = llama_init_from_model(m, cp);
+        if (!c && kv_type() != GGML_TYPE_F16) { cp.type_k = cp.type_v = GGML_TYPE_F16; c = llama_init_from_model(m, cp); }   // quantized V cache needs flash attention: fall back if this build lacks it
         return c != nullptr;
     }
     // Applies the model's own chat template (ChatML fallback), then samples up to max_new tokens.
@@ -642,12 +647,12 @@ static S http_get(const S& url, const S& post = "") {
     return out;
 }
 // Order: your SearXNG (KIBAVOICE_SEARCH_URL) -> DuckDuckGo HTML -> Wikipedia.
-static S web_search(const S& q) {
+static S web_search(const S& q, size_t urllen = 100) {
     if (q.empty()) return "No query.";
     S r; int n = 0;
     auto add = [&](const S& t, const S& sn, const S& u) {
         if (n >= 4 || t.empty()) return;
-        r += std::to_string(++n) + ". " + oneline(t, 80) + ": " + oneline(sn, 200) + (u.empty() ? S() : " [" + oneline(u, 100) + "]") + "\n";
+        r += std::to_string(++n) + ". " + oneline(t, 80) + ": " + oneline(sn, 200) + (u.empty() ? S() : " [" + oneline(u, urllen) + "]") + "\n";
     };
     S sx = env_or("KIBAVOICE_SEARCH_URL", "");
     if (!sx.empty()) { J j = jparse(http_get(sx + (sx.find('?') == S::npos ? "?" : "&") + "q=" + url_enc(q) + "&format=json")); for (auto& x : j["results"].a) add(x["title"].str(), x["content"].str(), x["url"].str()); }
@@ -1193,8 +1198,9 @@ static S mcp_call(const S& sv, const S& tool, const J& args) {
 
 // ------------------------------------------------------ connecting accounts --
 // "Hey Kiba, connect to my Notion account": find the right endpoint, open the sign-in window, save the
-// result. Known services are tried first; anything else is looked up in the public connector registry,
-// then guessed from the name. A candidate must answer like a real endpoint (working or asking for sign-in).
+// result. Known services are tried first; anything else is looked up in the public connector registry, then on the
+// web (docs and search results), then guessed from the name. A candidate must answer like a real endpoint (working or
+// asking for sign-in), and one found by Kiba must belong to the service's own domain (or be published by it in the registry).
 struct Known { const char* key; const char* label; const char* url; };
 static const Known kKnown[] = {
     {"notion", "Notion", "https://mcp.notion.com/mcp"},     {"linear", "Linear", "https://mcp.linear.app/mcp"},
@@ -1204,15 +1210,51 @@ static const Known kKnown[] = {
     {"vercel", "Vercel", "https://mcp.vercel.com"},
 };
 enum class Probe { Open, NeedsSignIn, Dead };
-static Probe probe_server(const S& key, const S& url, S& www) {
+// A 401/403 alone proves nothing (any website can answer that). For endpoints Kiba found by itself, an MCP server must
+// also say so: a Bearer challenge / resource_metadata in the header, or OAuth protected-resource metadata next to it.
+static bool mcp_auth_plausible(const S& url, const S& www) {
+    S l = lower(www);
+    if (l.find("bearer") != S::npos || l.find("resource_metadata") != S::npos) return true;
+    S o = url_origin(url), pa = url_path(url);
+    for (const S& u : {o + "/.well-known/oauth-protected-resource" + (pa == "/" ? S() : pa), o + "/.well-known/oauth-protected-resource"}) {
+        J j = jparse(http_get(u));
+        if (!j["authorization_servers"].a.empty()) return true;
+    }
+    return false;
+}
+static Probe probe_server(const S& key, const S& url, S& www, bool strict = false) {
     Mcp m(Srv{key, url, ""}); S err;
     if (m.open(err)) return Probe::Open;
-    if (m.auth_needed) { www = m.www; return Probe::NeedsSignIn; }
+    if (m.auth_needed) { www = m.www; return (!strict || mcp_auth_plausible(url, www)) ? Probe::NeedsSignIn : Probe::Dead; }
     return Probe::Dead;
+}
+// ---- finding endpoints without being told where they are (they need not start with "mcp.") ----
+static S host_of(const S& u) { size_t p = u.find("//"); if (p == S::npos) return ""; S h = lower(u.substr(p + 2)); h = h.substr(0, h.find_first_of("/?#")); return h.substr(0, h.find(':')); }
+static const std::set<S>& second_levels() { static const std::set<S> v{"co", "com", "org", "net", "ac", "gov", "edu"}; return v; }
+static S reg_label(const S& host) {   // "mcp.notion.com" -> "notion", "x.example.co.uk" -> "example"
+    VS L; std::stringstream ss(host); for (S t; std::getline(ss, t, '.');) L.push_back(t);
+    if (L.size() < 2) return "";
+    if (L.size() >= 3 && L.back().size() == 2 && second_levels().count(L[L.size() - 2])) return L[L.size() - 3];
+    return L[L.size() - 2];
+}
+static S alnum_only(const S& x) { S o; for (char c : x) if (isalnum((unsigned char)c)) o += c; return o; }
+// The site that owns the endpoint must be the service itself: "notion.so", "mcp.notion.com", "app.notion.so/mcp" count,
+// "notion.evil.com" or "notion-free-mcp.com" do not.
+static bool domain_bound(const S& u, const S& key) { S l = alnum_only(reg_label(host_of(u))); return !key.empty() && l == key; }
+// Registry names are reverse-DNS ("com.notion/notion"); the registry checks who owns that domain, so the endpoint
+// itself may live anywhere. GitHub/GitLab-style names prove nothing about the service and are ignored.
+static bool namespace_bound(const S& regname, const S& key) {
+    S ns = lower(regname.substr(0, regname.find('/')));
+    if (ns.rfind("io.github.", 0) == 0 || ns.rfind("io.gitlab.", 0) == 0 || ns.rfind("com.github", 0) == 0) return false;
+    VS L; std::stringstream ss(ns); for (S t; std::getline(ss, t, '.');) L.push_back(t);
+    if (L.size() >= 3 && L[0].size() == 2 && second_levels().count(L[1])) return alnum_only(L[2]) == key;
+    return L.size() >= 2 && alnum_only(L[1]) == key;
 }
 static VS registry_candidates(const S& raw, const S& key) {
     std::vector<std::pair<int, S>> sc;
-    J j = jparse(http_get("https://registry.modelcontextprotocol.io/v0/servers?search=" + url_enc(raw) + "&limit=30"));
+    VS qs{raw}; if (key != lower(raw)) qs.push_back(key);
+    std::vector<J> pages; for (auto& qq : qs) pages.push_back(jparse(http_get("https://registry.modelcontextprotocol.io/v0/servers?search=" + url_enc(qq) + "&limit=30")));
+    for (auto& j : pages)
     for (auto& e : j["servers"].a) {
         const J& sv = e["server"].t == 'o' ? e["server"] : e;
         S nm = lower(sv["name"].str() + " " + sv["title"].str());
@@ -1221,7 +1263,8 @@ static VS registry_candidates(const S& raw, const S& key) {
             if (ty.find("streamable") == S::npos) continue;
             if (!r["headers"].a.empty() || u.find('{') != S::npos || !https_only(u) || !public_url(u)) continue;   // needs a pasted key, or a template: not a sign-in flow
             int s = 0;
-            if (lower(url_origin(u)).find(key) != S::npos) s += 5;   // the host must really be that service
+            if (lower(url_origin(u)).find(key) != S::npos) s += 5;   // the host is that service...
+            if (namespace_bound(sv["name"].str(), key)) s += 5;       // ...or the registry says the service published it (any host)
             if (nm.find(key) != S::npos) s += 2;
             if (s >= 5) sc.push_back({s, u});
         }
@@ -1229,6 +1272,48 @@ static VS registry_candidates(const S& raw, const S& key) {
     std::stable_sort(sc.begin(), sc.end(), [](const std::pair<int, S>& a, const std::pair<int, S>& b) { return a.first > b.first; });
     VS o; for (auto& p : sc) { if (o.size() >= 3) break; if (std::find(o.begin(), o.end(), p.second) == o.end()) o.push_back(p.second); }
     return o;
+}
+// https URLs inside a page or search result that belong to the service and look like MCP endpoints.
+static VS urls_in(const S& text, const S& key) {
+    VS out;
+    for (size_t p = 0; (p = text.find("https://", p)) != S::npos;) {
+        size_t e = p; while (e < text.size() && text[e] && !strchr(" \t\r\n\"'<>()[]{}`\\,;|^", text[e])) ++e;
+        S u = text.substr(p, e - p); p = e > p ? e : p + 8;
+        while (!u.empty() && strchr(".:!?*", u.back())) u.pop_back();
+        size_t q = u.find_first_of("?#"); if (q != S::npos) u.resize(q);
+        if (u.size() > 200 || lower(u).find("mcp") == S::npos || !domain_bound(u, key) || !public_url(u)) continue;
+        if (std::find(out.begin(), out.end(), u) == out.end()) out.push_back(u);
+        if (out.size() >= 6) break;
+    }
+    return out;
+}
+// Ask the web: search for the service's MCP docs and read what the top pages and snippets point to.
+static VS web_candidates(const S& label, const S& key) {
+    VS out, pages;
+    S res = web_search(label + " remote MCP server URL", 400);
+    for (size_t p = 0; (p = res.find(" [https://", p)) != S::npos;) { size_t b = p + 2, e = res.find(']', b); if (e == S::npos) break; pages.push_back(res.substr(b, e - b)); p = e; }
+    auto grab = [&](const S& t) { for (auto& u : urls_in(t, key)) if (out.size() < 6 && std::find(out.begin(), out.end(), u) == out.end()) out.push_back(u); };
+    grab(res);
+    for (auto& pg : pages) { if (out.size() >= 6) break; if (public_url(pg)) grab(http_get(pg)); }
+    return out;
+}
+static bool resolves(const S& host) {
+    addrinfo hints{}, *r = nullptr; hints.ai_socktype = SOCK_STREAM;
+    int rc = getaddrinfo(host.c_str(), "443", &hints, &r);
+    if (r) freeaddrinfo(r);
+    return rc == 0;
+}
+// Last resort: the usual homes for an MCP endpoint (mcp.x.com, x.com/mcp, api.x.com, app.x.so/mcp, x.ai/v1/mcp ...).
+// Only hosts that exist are kept, so this is quick.
+static VS guess_candidates(const S& key) {
+    VS out;
+    for (const char* tld : {"com", "app", "io", "ai", "so", "dev", "co", "net", "org", "sh"})
+        for (const char* sub : {"mcp.", "", "api.", "app."}) {
+            S host = S(sub) + key + "." + tld;
+            if (!resolves(host)) continue;
+            for (const char* path : {"/mcp", "", "/v1/mcp", "/api/mcp", "/mcp/"}) out.push_back("https://" + host + path);
+        }
+    return out;
 }
 static S signin_failure(const S& label, const S& why) {
     if (why == "timeout") return "I didn't see you finish signing in to " + label + ". Ask me again whenever you're ready.";
@@ -1245,11 +1330,20 @@ static S connect_account(const S& raw_in, bool* ok = nullptr) {
     { S up = key; for (auto& ch : up) ch = (char)toupper((unsigned char)ch); S ov = env_or(("KIBAVOICE_CONNECTOR_" + up).c_str(), ""); if (https_only(ov)) known.insert(known.begin(), ov); }   // optional per-service endpoint override
     for (auto& s : mcp_load()) if (s.name == key && mcp_refresh(s).empty()) { if (ok) *ok = true; return label + " is already connected."; }   // still works (refreshes quietly if needed)
     Srv s{key, "", ""}; S www; Probe pr = Probe::Dead;
-    auto try_urls = [&](const VS& list) { for (auto& u : list) { Probe p = probe_server(key, u, www); if (p != Probe::Dead) { s.target = u; pr = p; return true; } } return false; };
+    // strict = found by Kiba, not known in advance: must answer like a real MCP server. max_sec bounds the slow guessing.
+    auto try_urls = [&](const VS& list, bool strict = false, int max_sec = 0) {
+        auto t0 = Clock::now();
+        for (auto& u : list) {
+            if (max_sec && std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - t0).count() > max_sec) break;
+            Probe p = probe_server(key, u, www, strict);
+            if (p != Probe::Dead) { s.target = u; pr = p; return true; }
+        }
+        return false;
+    };
     if (!try_urls(known)) {
-        VS more = registry_candidates(raw, key);
-        for (S g : {"https://mcp." + key + ".com/mcp", "https://" + key + ".com/mcp", "https://api." + key + ".com/mcp"}) more.push_back(g);
-        if (!try_urls(more)) return known.empty() ? "I couldn't find a way to connect to " + label + " yet." : "I couldn't reach " + label + " right now. Check your connection and ask me again.";
+        if (g_say) g_say("Let me look for " + label + "'s connection.");
+        if (!try_urls(registry_candidates(raw, key)) && !try_urls(web_candidates(label, key), true) && !try_urls(guess_candidates(key), true, 40))
+            return known.empty() ? "I couldn't find a way to connect to " + label + " yet." : "I couldn't reach " + label + " right now. Check your connection and ask me again.";
     }
     if (pr == Probe::NeedsSignIn) { S why = oauth_login(s, www, label); if (!why.empty()) return signin_failure(label, why); }
     int n = 0;

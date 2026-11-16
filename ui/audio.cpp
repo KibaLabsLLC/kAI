@@ -2,28 +2,131 @@
 
 #include <QCoreApplication>
 #include <QDateTime>
-#include <QDebug>
+#include <QDir>
 #include <QFile>
-#include <QProcess>
 #include <QProcessEnvironment>
 #include <QRegularExpression>
+#include <QSet>
 #include <QStandardPaths>
 #include <QTimer>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
-#include <functional>
-#include <unordered_map>
 
 namespace {
 constexpr int kFrame = 320;            // 20 ms at 16 kHz
 constexpr int kPreRoll = 10;           // 200 ms
-constexpr int kMinWake = 18;           // ignore blips shorter than ~0.36 s
+constexpr int kMinWake = 18;           // a wake segment needs ~0.36 s of sound (pre-roll included); clicks and coughs are shorter
 constexpr int kWakeEnd = 30;           // 0.6 s of quiet ends a wake segment
-constexpr int kWakeMax = 400;          // 8 s
+constexpr int kWakeMax = 300;          // 6 s: "speech" that never pauses is the room, not a person
 constexpr int kCmdEnd = 50;            // 1 s of quiet ends a command
 constexpr int kCmdMax = 750;           // 15 s
 constexpr int kCmdNoSpeech = 300;      // 6 s
+
+bool dbg() { static const bool d = qEnvironmentVariableIsSet("KIBAVOICE_DEBUG"); return d; }
+// Lowest threshold the detector will use. Raise it in a noisy room, lower it for a quiet mic:
+//   KIBAVOICE_MIC_FLOOR=150
+double thrFloor() { static const double f = std::max(50.0, qEnvironmentVariable("KIBAVOICE_MIC_FLOOR", "300").toDouble()); return f; }
+
+struct Recorder { const char* prog; QStringList args; };
+const std::vector<Recorder>& recorders() {   // tried in order; if one dies right away the next one is used
+    static const std::vector<Recorder> all = {
+        {"arecord", {"-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw"}},
+        {"parecord", {"--raw", "--rate=16000", "--channels=1", "--format=s16le"}},   // PipeWire/Pulse systems without ALSA's default device
+    };
+    return all;
+}
+
+
+// ---- who else is recording? --------------------------------------------------------------------------------------
+// Kiba lets go of the mic while another app is recording and takes it back when that app stops
+// (set KIBAVOICE_MIC_YIELD=0 to turn this off).
+bool yieldEnabled() { static const bool on = qEnvironmentVariable("KIBAVOICE_MIC_YIELD", "1") != "0"; return on; }
+
+// True if `pid` is `root` or one of its descendants: the recorder, whatever shell started it, anything of ours.
+bool descendsFrom(qint64 pid, qint64 root) {
+    for (int i = 0; i < 10 && pid > 1; ++i) {
+        if (pid == root) return true;
+        QFile f(QString("/proc/%1/stat").arg(pid));
+        if (!f.open(QIODevice::ReadOnly)) return false;
+        const QByteArray s = f.readAll();
+        const int rp = s.lastIndexOf(')');
+        if (rp < 0) return false;
+        const QList<QByteArray> parts = s.mid(rp + 2).split(' ');   // "S <ppid> ..." after the command name
+        if (parts.size() < 2) return false;
+        pid = parts[1].toLongLong();
+    }
+    return pid == root;
+}
+
+QString propValue(const QString& line, const char* key) {   // `key = "value"`
+    const QString k = QString::fromLatin1(key) + " = ";
+    if (!line.startsWith(k)) return QString();
+    QString v = line.mid(k.size()).trimmed();
+    if (v.size() >= 2 && v.startsWith('"') && v.endsWith('"')) v = v.mid(1, v.size() - 2);
+    return v;
+}
+
+// PipeWire/PulseAudio: output of "pactl list short sources", a marker line, then "pactl list source-outputs" (LC_ALL=C).
+// Returns the name of the first app that is really recording, or "". Ignored: our own streams, paused (corked) streams,
+// streams on a ".monitor" source (screen/system audio) and volume-meter "peak detect" streams.
+QString busyByPactl(const QString& out, qint64 root) {
+    static const QString kSplit = "@@SPLIT@@";
+    const int sep = out.indexOf(kSplit);
+    const QString srcs = sep < 0 ? QString() : out.left(sep), outs = sep < 0 ? out : out.mid(sep + kSplit.size());
+    QSet<QString> monitors;
+    for (const QString& l : srcs.split('\n')) {
+        const QStringList c = l.split('\t');
+        if (c.size() >= 2 && c[1].trimmed().endsWith(".monitor")) monitors.insert(c[0].trimmed());
+    }
+    const QStringList blocks = outs.split("Source Output #");
+    for (int i = 1; i < blocks.size(); ++i) {
+        QString src, name, bin, media, pid; bool corked = false;
+        for (QString l : blocks[i].split('\n')) {
+            l = l.trimmed();
+            if (l.startsWith("Corked:")) corked = l.mid(7).trimmed() == "yes";
+            else if (l.startsWith("Source:")) src = l.mid(7).trimmed();
+            else if (const QString v = propValue(l, "application.name"); !v.isEmpty()) name = v;
+            else if (const QString v2 = propValue(l, "application.process.binary"); !v2.isEmpty()) bin = v2;
+            else if (const QString v3 = propValue(l, "application.process.id"); !v3.isEmpty()) pid = v3;
+            else if (const QString v4 = propValue(l, "media.name"); !v4.isEmpty()) media = v4;
+        }
+        if (corked || monitors.contains(src) || media.contains("peak detect", Qt::CaseInsensitive)) continue;
+        bool ok = false; const qint64 p = pid.toLongLong(&ok);
+        if (ok && p > 0 && descendsFrom(p, root)) continue;   // that's us
+        return !name.isEmpty() ? name : !bin.isEmpty() ? bin : QString("another app");
+    }
+    return QString();
+}
+
+// Plain ALSA (no sound server): a capture substream that is RUNNING and owned by someone who isn't us. Sound servers
+// are skipped, since they hold the device on behalf of whichever app is recording (pactl covers that case).
+QString busyByAlsa(qint64 root, const QString& base = "/proc/asound") {
+    static const QSet<QString> servers{"pipewire", "pipewire-pulse", "pulseaudio", "wireplumber", "jackd"};
+    const QDir b(base);
+    for (const QString& card : b.entryList({"card*"}, QDir::Dirs | QDir::NoDotAndDotDot)) {
+        const QDir cd(b.filePath(card));
+        for (const QString& pcm : cd.entryList({"pcm*c"}, QDir::Dirs | QDir::NoDotAndDotDot)) {   // "c" = capture
+            const QDir pd(cd.filePath(pcm));
+            for (const QString& sub : pd.entryList({"sub*"}, QDir::Dirs | QDir::NoDotAndDotDot)) {
+                QFile f(pd.filePath(sub) + "/status");
+                if (!f.open(QIODevice::ReadOnly)) continue;
+                const QString s = QString::fromLatin1(f.readAll());
+                if (!s.contains("RUNNING")) continue;
+                const QRegularExpressionMatch m = QRegularExpression("owner_pid\\s*:\\s*(\\d+)").match(s);
+                if (!m.hasMatch()) continue;
+                const qint64 pid = m.captured(1).toLongLong();
+                if (descendsFrom(pid, root)) continue;
+                QFile c(QString("/proc/%1/comm").arg(pid));
+                const QString comm = c.open(QIODevice::ReadOnly) ? QString::fromLocal8Bit(c.readAll()).trimmed() : QString();
+                if (servers.contains(comm)) continue;
+                return comm.isEmpty() ? QString("another app") : comm;
+            }
+        }
+    }
+    return QString();
+}
 
 double goertzel(const int16_t* x, int n, double hz) {
     const double k = 2.0 * std::cos(2.0 * M_PI * hz / 16000.0);
@@ -44,124 +147,16 @@ bool writeWav(const QString& path, const std::vector<int16_t>& pcm) {
     f.write((const char*)pcm.data(), data);
     return true;
 }
-
-// ---- Mic hand-off ---------------------------------------------------------------------------
-// While we listen, we poll the sound server for *other* apps that are actively recording. When one
-// shows up we close our recorder (releasing the mic); once it has been gone for a couple of polls
-// we reopen it and re-calibrate. State lives here so audio.h does not need to change.
-struct Guard {
-    QTimer* timer = nullptr;
-    QProcess* probe = nullptr;
-    std::function<void(const QString&)> apply;   // feed it the name of the other recorder ("" = none)
-    bool yielded = false;     // recorder closed on purpose (or because the device was busy)
-    bool noPactl = false;     // no pactl -> only the "device busy, retry" path works
-    int clear = 0;            // consecutive polls with no other recorder
-    int quickFails = 0;       // recorder died right after start (device busy) in a row
-    qint64 startedMs = 0;
-    QString who;
-};
-std::unordered_map<const MicCapture*, Guard> g_guards;
-
-qint64 ppidOf(qint64 pid) {
-    QFile f(QString("/proc/%1/stat").arg(pid));
-    if (!f.open(QIODevice::ReadOnly)) return 0;
-    const QByteArray s = f.readAll();
-    const int rp = s.lastIndexOf(')');                     // comm can contain spaces and parens
-    if (rp < 0) return 0;
-    const QList<QByteArray> t = s.mid(rp + 2).split(' ');   // state ppid ...
-    return t.size() > 1 ? t[1].toLongLong() : 0;
-}
-bool descendantOf(qint64 pid, qint64 root) {
-    for (int i = 0; pid > 1 && i < 8; ++i) { if (pid == root) return true; pid = ppidOf(pid); }
-    return false;
-}
-
-// Name of the first app other than us that is actively recording, or "".
-QString otherRecorder(const QString& text, qint64 ourRecorderPid) {
-    const qint64 self = QCoreApplication::applicationPid();
-    const QStringList blocks = text.split(QRegularExpression("\n(?=Source Output #)"));
-    for (const QString& b : blocks) {
-        if (!b.contains("Source Output #")) continue;
-        if (b.contains(QRegularExpression("Corked:\\s*yes"))) continue;       // paused stream, not using the mic
-        auto prop = [&](const QString& key) {
-            const auto m = QRegularExpression("\\b" + QRegularExpression::escape(key) + " = \"([^\"]*)\"").match(b);
-            return m.hasMatch() ? m.captured(1) : QString();
-        };
-        if (prop("stream.capture.sink") == "true") continue;                   // listening to a speaker monitor
-        if (prop("media.name").contains("peak detect", Qt::CaseInsensitive)) continue;   // volume meters
-        const qint64 pid = prop("application.process.id").toLongLong();
-        const QString bin = prop("application.process.binary");
-        if (pid == self || (pid > 0 && ourRecorderPid > 0 && descendantOf(pid, ourRecorderPid))) continue;   // that's us
-        if (pid <= 0 && bin == "arecord") continue;
-        const QString name = prop("application.name");
-        return !name.isEmpty() ? name : (!bin.isEmpty() ? bin : QStringLiteral("another app"));
-    }
-    return QString();
-}
 }  // namespace
 
 MicCapture::MicCapture(QObject* parent) : QObject(parent) {
-    Guard& g = g_guards[this];
-    g.noPactl = QStandardPaths::findExecutable("pactl").isEmpty();
-    g.timer = new QTimer(this);
-    g.timer->setInterval(1000);
-
-    g.apply = [this](const QString& who) {
-        Guard& G = g_guards[this];
-        if (mode_ == Off) return;
-        if (!G.yielded) {
-            if (who.isEmpty() || !proc_) return;
-            qInfo().noquote() << "mic: releasing for" << who;
-            G.yielded = true; G.clear = 0; G.who = who;
-            stopProcess(); resetAnalysis();
-            if (mode_ == Command) { mode_ = Paused; emit nothingHeard(); }   // don't leave the window waiting
-            return;
-        }
-        if (!who.isEmpty()) { G.clear = 0; G.who = who; return; }
-        const int need = std::min(2 + G.quickFails, 6);   // debounce; back off while the device keeps refusing us
-        if (++G.clear < need) return;
-        qInfo() << "mic: reclaiming";
-        G.yielded = false; G.clear = 0;
-        calibrated_ = false; calib_ = 0; noise_ = 0;
-        if (!ensureProcess()) { mode_ = Off; G.timer->stop(); }
-    };
-
-    connect(g.timer, &QTimer::timeout, this, [this] {
-        Guard& G = g_guards[this];
-        if (mode_ == Off) { G.timer->stop(); return; }
-        if (G.probe) return;                             // previous poll still running
-        if (G.noPactl) { G.apply(QString()); return; }   // can only retry a busy device
-        auto* p = new QProcess(this);
-        G.probe = p;
-        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-        env.insert("LC_ALL", "C");                       // "Corked: yes" must not be translated
-        p->setProcessEnvironment(env);
-        connect(p, &QProcess::errorOccurred, this, [this, p](QProcess::ProcessError e) {
-            if (e != QProcess::FailedToStart) return;
-            Guard& G2 = g_guards[this];
-            G2.noPactl = true; G2.probe = nullptr; p->deleteLater();
-        });
-        connect(p, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
-                [this, p](int code, QProcess::ExitStatus st) {
-            Guard& G2 = g_guards[this];
-            G2.probe = nullptr;
-            const QString out = QString::fromUtf8(p->readAllStandardOutput());
-            p->deleteLater();
-            if (code != 0 || st != QProcess::NormalExit) { G2.apply(QString()); return; }   // no sound server: nothing to detect
-            G2.apply(otherRecorder(out, proc_ ? proc_->processId() : 0));
-        });
-        QTimer::singleShot(2000, p, [p] { if (p->state() != QProcess::NotRunning) p->kill(); });
-        p->start("pactl", {"list", "source-outputs"});
-    });
+    watch_ = new QTimer(this);
+    watch_->setInterval(1000);
+    connect(watch_, &QTimer::timeout, this, &MicCapture::watchTick);
 }
-
 MicCapture::~MicCapture() {
+    if (probe_) { probe_->disconnect(this); probe_->kill(); probe_->waitForFinished(200); }
     stopProcess();
-    auto it = g_guards.find(this);
-    if (it != g_guards.end()) {
-        if (it->second.probe) { it->second.probe->disconnect(this); it->second.probe->kill(); }
-        g_guards.erase(it);
-    }
 }
 
 void MicCapture::resetAnalysis() {
@@ -171,57 +166,137 @@ void MicCapture::resetAnalysis() {
 
 void MicCapture::setMode(Mode m) {
     if (m == mode_) return;
+    const Mode prev = mode_;
     mode_ = m;
     resetAnalysis();
-    Guard& G = g_guards[this];
     if (m == Off) {
-        G.yielded = false; G.clear = 0; G.quickFails = 0; G.timer->stop();
-        stopProcess();
+        stopProcess(); watch_->stop();
+        yielded_ = false; busyTicks_ = freeTicks_ = 0; notifyYield(false, QString());
         return;
     }
+    if (prev == Off) fails_ = 0;
+    if (m == Command && yielded_) { yielded_ = false; notifyYield(false, QString()); }   // the user just asked for Kiba: take the mic back
+    if (yieldEnabled() && !watch_->isActive()) watch_->start();
+    if (!ensureProcess()) mode_ = Off;
+}
+
+// ---- yielding the mic to other apps -----------------------------------------------------------------------------
+void MicCapture::notifyYield(bool y, const QString& who) {   // tell the UI only when the state it knows about changes
+    if (uiYielded_ == y) return;
+    uiYielded_ = y;
+    emit micYielded(y, who);
+}
+
+void MicCapture::yieldMic(const QString& who) {
+    yielded_ = true; freeTicks_ = 0;
+    stopProcess(); resetAnalysis();   // really let go of the device
+    if (dbg()) std::fprintf(stderr, "mic: %s is recording, so Kiba is letting go of the mic\n", qPrintable(who));
+    notifyYield(true, who);
+}
+
+void MicCapture::reclaimMic() {
+    yielded_ = false; busyTicks_ = freeTicks_ = 0;
+    fails_ = 3;   // if the device is somehow still busy, one more failure hands it back again instead of retrying noisily
+    resetAnalysis();
+    if (dbg()) std::fprintf(stderr, "mic: nobody else is recording, Kiba is taking the mic back\n");
     if (!ensureProcess()) { mode_ = Off; return; }
-    if (!G.timer->isActive()) G.timer->start();
+    QTimer::singleShot(3000, this, [this] { if (!yielded_ && proc_) notifyYield(false, QString()); });   // tell the UI once it has held
+}
+
+void MicCapture::watchTick() {
+    if (mode_ == Off || probe_) return;
+    if (mode_ == Command) { busyTicks_ = freeTicks_ = 0; return; }   // an explicit request from the user always wins
+    const qint64 self = QCoreApplication::applicationPid();
+    if (QStandardPaths::findExecutable("pactl").isEmpty()) { applyProbe(busyByAlsa(self)); return; }
+    probe_ = new QProcess(this);
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    env.insert("LC_ALL", "C");   // stable field names
+    probe_->setProcessEnvironment(env);
+    connect(probe_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this, self](int code, QProcess::ExitStatus) {
+        const QString out = QString::fromUtf8(probe_->readAllStandardOutput());
+        probe_->deleteLater(); probe_ = nullptr;
+        applyProbe(code == 0 ? busyByPactl(out, self) : busyByAlsa(self));   // no sound server running: fall back to plain ALSA
+    });
+    connect(probe_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart && probe_) { probe_->deleteLater(); probe_ = nullptr; }
+    });
+    probe_->start("/bin/sh", {"-c", "pactl list short sources; echo @@SPLIT@@; pactl list source-outputs"});
+    QTimer::singleShot(3000, probe_, [p = probe_] { if (p->state() != QProcess::NotRunning) p->kill(); });   // a hung sound server must not stall us
+}
+
+// Two readings in a row before acting either way, so a stream that blips on and off can't make Kiba flap.
+void MicCapture::applyProbe(const QString& who) {
+    if (mode_ == Off || mode_ == Command) return;
+    if (!who.isEmpty()) {
+        freeTicks_ = 0;
+        if (++busyTicks_ >= 2 && !yielded_) yieldMic(who);
+    } else {
+        busyTicks_ = 0;
+        if (yielded_ && ++freeTicks_ >= 2) reclaimMic();
+    }
 }
 
 bool MicCapture::ensureProcess() {
-    if (proc_) return true;
-    Guard& G = g_guards[this];
-    if (G.yielded) return true;        // another app has the mic; the poller reopens us when it is free
+    if (proc_ || yielded_) return true;   // (while yielded there is deliberately no recorder)
+    QString prog; QStringList args;
     // Same contract as the CLI: KIBAVOICE_REC_CMD overrides the recorder (env/constant only).
-    QString cmd = qEnvironmentVariable("KIBAVOICE_REC_CMD");
-    if (cmd.isEmpty()) {
-        if (QStandardPaths::findExecutable("arecord").isEmpty()) {
-            emit error("arecord not found (install alsa-utils)");
-            return false;
-        }
-        cmd = "exec arecord -q -f S16_LE -r 16000 -c 1 -t raw 2>/dev/null";   // exec: killing the shell must kill arecord itself
+    const QString cmd = qEnvironmentVariable("KIBAVOICE_REC_CMD");
+    if (!cmd.isEmpty()) {
+        prog = "/bin/sh"; args = {"-c", cmd};
+    } else {
+        std::vector<const Recorder*> have;
+        for (const auto& r : recorders()) if (!QStandardPaths::findExecutable(r.prog).isEmpty()) have.push_back(&r);
+        if (have.empty()) { emit error("no recorder found (install alsa-utils)"); return false; }
+        const Recorder& r = *have[size_t(recIdx_) % have.size()];
+        prog = r.prog; args = r.args;   // started directly, not through a shell, so stopping it really stops it
     }
-    buf_.clear();
+    buf_.clear(); lastErr_.clear();
     proc_ = new QProcess(this);
     connect(proc_, &QProcess::readyReadStandardOutput, this, &MicCapture::onReadyRead);
-    connect(proc_, &QProcess::errorOccurred, this, [this](QProcess::ProcessError e) {
-        if (e == QProcess::FailedToStart) { stopProcess(); mode_ = Off; emit error("could not start the recorder"); }
+    connect(proc_, &QProcess::readyReadStandardError, this, [this] {   // keep the recorder's own explanation instead of discarding it
+        if (!proc_) return;
+        const QString s = QString::fromLocal8Bit(proc_->readAllStandardError()).trimmed();
+        if (!s.isEmpty()) lastErr_ = s.section('\n', -1);
     });
-    connect(proc_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this](int code, QProcess::ExitStatus) {
-        Guard& G2 = g_guards[this];
+    connect(proc_, &QProcess::errorOccurred, this, [this, prog](QProcess::ProcessError e) {
+        if (e == QProcess::FailedToStart) { stopProcess(); recorderGone("could not start " + prog); }
+    });
+    connect(proc_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, [this](int, QProcess::ExitStatus) {
+        if (proc_) {
+            const QString s = QString::fromLocal8Bit(proc_->readAllStandardError()).trimmed();
+            if (!s.isEmpty()) lastErr_ = s.section('\n', -1);
+        }
+        const QString why = lastErr_;
         stopProcess();
-        if (mode_ == Off) return;
-        if (code == 126 || code == 127) {   // recorder missing / not executable: retrying cannot help
-            mode_ = Off; G2.yielded = false; G2.timer->stop();
-            emit error("microphone stopped");
+        recorderGone(why);
+    });
+    startMs_ = QDateTime::currentMSecsSinceEpoch();
+    proc_->start(prog, args);
+    return true;
+}
+
+// The recorder exited (device busy, no default device, server restart...). Retry quietly, switching recorder each
+// time, so a hiccup never reaches the UI; only after repeated quick failures is the mic reported as stopped.
+void MicCapture::recorderGone(const QString& why) {
+    const Mode want = mode_;
+    if (want == Off) return;
+    if (QDateTime::currentMSecsSinceEpoch() - startMs_ > 10000) fails_ = 0;   // it had been running fine
+    ++fails_; ++recIdx_;
+    if (dbg()) std::fprintf(stderr, "kibavoice-ui: recorder stopped (%s), attempt %d\n", qPrintable(why.isEmpty() ? QString("no message") : why), fails_);
+    if (fails_ > 3) {
+        fails_ = 0;
+        const bool busy = why.contains("busy", Qt::CaseInsensitive) || why.contains("in use", Qt::CaseInsensitive);
+        if (busy && yieldEnabled()) {   // someone else has the device exclusively: wait for them instead of giving up
+            if (!yielded_) { yielded_ = true; busyTicks_ = freeTicks_ = 0; notifyYield(true, QString("another app")); }
             return;
         }
-        // Anything else (device grabbed by another app, source suspended, hw busy at open): keep
-        // wanting the mic and retry with a growing delay for as long as we are not Off.
-        if (++G2.quickFails == 1) qInfo() << "mic: recorder stopped (device taken?), will keep retrying";
-        G2.yielded = true; G2.clear = 0; G2.who = "another app";
-        resetAnalysis();
-        if (mode_ == Command) { mode_ = Paused; emit nothingHeard(); }
-        G2.timer->start();
+        mode_ = Off;
+        emit error(why.isEmpty() ? QString("microphone stopped") : "microphone stopped: " + why);
+        return;
+    }
+    QTimer::singleShot(fails_ * 500, this, [this, want] {
+        if (!proc_ && !yielded_ && mode_ == want && !ensureProcess()) mode_ = Off;
     });
-    G.startedMs = QDateTime::currentMSecsSinceEpoch();
-    proc_->start("/bin/sh", {"-c", cmd});
-    return true;
 }
 
 void MicCapture::stopProcess() {
@@ -236,7 +311,6 @@ void MicCapture::stopProcess() {
 
 void MicCapture::onReadyRead() {
     if (!proc_) return;
-    g_guards[this].quickFails = 0;     // data is flowing: the device opened fine
     buf_ += proc_->readAllStandardOutput();
     const int bytes = kFrame * 2;
     while (proc_ && buf_.size() >= bytes) {
@@ -254,6 +328,12 @@ void MicCapture::processFrame(const int16_t* f) {
     for (int i = 0; i < kFrame; ++i) e += double(f[i]) * f[i];
     const double rms = std::sqrt(e / kFrame);
 
+    if (dbg()) {   // once a second: loudest frame heard vs the threshold it has to beat
+        static double peak = 0; static int tick = 0;
+        peak = std::max(peak, rms);
+        if (++tick % 50 == 0) { std::fprintf(stderr, "mic %-4s peak=%5.0f noise=%5.0f threshold=%5.0f%s\n", mode_ == Wake ? "wake" : "cmd", peak, noise_, thr_, started_ ? "  (hearing sound)" : ""); peak = 0; }
+    }
+
     if (mode_ == Command) {   // visualizer feed only while the user is addressing Kiba
         const double lo = goertzel(f, kFrame, 250) + goertzel(f, kFrame, 450);
         const double mid = goertzel(f, kFrame, 900) + goertzel(f, kFrame, 1500);
@@ -262,10 +342,10 @@ void MicCapture::processFrame(const int16_t* f) {
         emit level(float(std::pow(std::min(1.0, rms / 5000.0), 0.6)), float(lo / sum), float(mid / sum), float(hi / sum));
     }
 
-    // noise floor: calibrate once, then keep tracking it while Wake mode hears nothing
+    // Calibrate on the first ~0.4 s (skipping the recorder's start-up pop), then keep tracking the noise floor.
     if (!calibrated_) {
-        noise_ += rms / 15;
-        if (++calib_ == 15) { thr_ = std::max(500.0, noise_ * 3.0); calibrated_ = true; }
+        if (++calib_ > 5) noise_ += rms / 15;
+        if (calib_ == 20) { thr_ = std::max(thrFloor(), noise_ * 3.0); calibrated_ = true; if (dbg()) std::fprintf(stderr, "mic calibrated: noise=%.0f threshold=%.0f\n", noise_, thr_); }
         return;
     }
 
@@ -274,10 +354,10 @@ void MicCapture::processFrame(const int16_t* f) {
         pre_.push_back(std::move(frame));
         if (int(pre_.size()) > kPreRoll) pre_.pop_front();
         loud_ = rms > thr_ ? loud_ + 1 : 0;
-        if (mode_ == Wake && loud_ == 0) {
-            noise_ = 0.98 * noise_ + 0.02 * rms;
-            thr_ = std::max(500.0, noise_ * 3.0);
-        }
+        // Follow the noise floor down quickly and up slowly, whatever the frame. (It used to adapt only on frames
+        // already below the threshold, so a room that got louder could never raise it: everything counted as speech.)
+        noise_ += (rms < noise_ ? 0.1 : 0.005) * (rms - noise_);
+        thr_ = std::max(thrFloor(), noise_ * 3.0);
         if (loud_ >= 3) {
             started_ = true; quiet_ = 0;
             for (auto& p : pre_) pcm_.insert(pcm_.end(), p.begin(), p.end());
@@ -299,10 +379,21 @@ void MicCapture::processFrame(const int16_t* f) {
 
 void MicCapture::finishUtterance() {
     const bool command = (mode_ == Command);
-    const int frames = len_;
+    const int frames = len_, voiced = len_ - quiet_;   // voiced = without the trailing silence that ended it
     std::vector<int16_t> pcm = std::move(pcm_);
     resetAnalysis();
-    if (!command && frames < kMinWake) return;
+    if (!command) {
+        if (voiced < kMinWake) { if (dbg()) std::fprintf(stderr, "mic: ignored a %.2f s blip\n", voiced * 0.02); return; }
+        if (frames >= kWakeMax) {   // it never went quiet: treat it as the new background level, not as speech
+            double e = 0; for (int16_t s : pcm) e += double(s) * s;
+            const double r = std::sqrt(e / double(std::max<size_t>(1, pcm.size())));
+            noise_ = std::max(noise_, std::min(r, 2000.0));
+            thr_ = std::max(thrFloor(), noise_ * 3.0);
+            if (dbg()) std::fprintf(stderr, "mic: %.0f s of constant sound, treating it as background (noise=%.0f threshold=%.0f)\n", frames * 0.02, noise_, thr_);
+            return;
+        }
+        if (dbg()) std::fprintf(stderr, "mic: wake segment %.1f s sent to speech recognition\n", frames * 0.02);
+    }
     if (command) {
         mode_ = Paused;   // the window decides what happens next
         emit level(0, 0.34f, 0.33f, 0.33f);

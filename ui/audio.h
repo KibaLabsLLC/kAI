@@ -33,8 +33,7 @@ signals:
     void nothingHeard();
     void error(const QString& message);
     // Emitted by notifyYield() only when the yield state the UI knows about changes.
-    // (Guessed name/signature: match whatever audio.cpp actually emits.)
-    void yieldChanged(bool yielded, const QString& who);
+    void micYielded(bool yielded, const QString& who);
 
 private slots:
     void watchTick();   // QTimer::timeout target
@@ -65,6 +64,7 @@ private:
     std::deque<std::vector<int16_t>> pre_;   // pre-roll so the first syllable isn't clipped
     bool started_ = false, calibrated_ = false;
     bool yielded_ = false;        // true while we've released the mic (no recorder running)
+    bool uiYielded_ = false;      // last yield state the UI was told about
     int calib_ = 0, loud_ = 0, quiet_ = 0, idle_ = 0, len_ = 0, seq_ = 0;
     int busyTicks_ = 0, freeTicks_ = 0, fails_ = 0, recIdx_ = 0;
     qint64 startMs_ = 0;

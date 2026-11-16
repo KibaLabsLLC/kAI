@@ -20,14 +20,15 @@ constexpr int kPreRoll = 10;           // 200 ms
 constexpr int kMinWake = 18;           // a wake segment needs ~0.36 s of sound (pre-roll included); clicks and coughs are shorter
 constexpr int kWakeEnd = 30;           // 0.6 s of quiet ends a wake segment
 constexpr int kWakeMax = 300;          // 6 s: "speech" that never pauses is the room, not a person
-constexpr int kCmdEnd = 50;            // 1 s of quiet ends a command
+constexpr int kCmdEnd = 35;            // 0.7 s of quiet ends a command
 constexpr int kCmdMax = 750;           // 15 s
 constexpr int kCmdNoSpeech = 300;      // 6 s
 
 bool dbg() { static const bool d = qEnvironmentVariableIsSet("KIBAVOICE_DEBUG"); return d; }
-// Lowest threshold the detector will use. Raise it in a noisy room, lower it for a quiet mic:
+// Lowest threshold the detector will use: 0 by default, so even a very quiet mic works (the room noise level still
+// sets it: 3x the noise). Raise it in a noisy room:
 //   KIBAVOICE_MIC_FLOOR=150
-double thrFloor() { static const double f = std::max(50.0, qEnvironmentVariable("KIBAVOICE_MIC_FLOOR", "300").toDouble()); return f; }
+double thrFloor() { static const double f = std::max(0.0, qEnvironmentVariable("KIBAVOICE_MIC_FLOOR", "0").toDouble()); return f; }
 
 struct Recorder { const char* prog; QStringList args; };
 const std::vector<Recorder>& recorders() {   // tried in order; if one dies right away the next one is used
@@ -372,7 +373,7 @@ void MicCapture::processFrame(const int16_t* f) {
 
     pcm_.insert(pcm_.end(), frame.begin(), frame.end());
     ++len_;
-    quiet_ = rms < thr_ ? quiet_ + 1 : 0;
+    quiet_ = rms <= thr_ ? quiet_ + 1 : 0;   // <=, so a threshold of 0 still ends on digital silence
     const bool wake = (mode_ == Wake);
     if (quiet_ >= (wake ? kWakeEnd : kCmdEnd) || len_ >= (wake ? kWakeMax : kCmdMax)) finishUtterance();
 }
